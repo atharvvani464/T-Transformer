@@ -40,7 +40,7 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
     
     def forward(self, x):
-        x = x + (self.pe[:,x.shape[1],:]).requires_grad(False) # Tensor Addition of Embeddings and Positionings
+        x = x + self.pe[:, :x.shape[1], :].requires_grad_(False) # Tensor Addition of Embeddings and Positionings
         return self.dropout(x) # Noise Reduction by Regularization
 
 
