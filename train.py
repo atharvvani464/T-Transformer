@@ -1,18 +1,24 @@
-import torch 
+import torch
 import torch.nn as nn
-
+from pathlib import Path
 from datasets import load_dataset
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.trainers import WordLevelTrainer
-
-from pathlib import Path
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from model import build_transformer
+
+# ensure directories exist
+Path("models").mkdir(exist_ok=True)
+Path("tokenizers").mkdir(exist_ok=True)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+bleu_smoother = SmoothingFunction().method1
 
 def get_all_sentences(ds, lang):
     for item in ds:
-        yield item['translation'][lang]
+        yield item["translation"][lang]
 
 def get_or_create_tokenizer(tokenizer_path, ds, lang):
     tokenizer_path = Path(tokenizer_path)
@@ -23,34 +29,25 @@ def get_or_create_tokenizer(tokenizer_path, ds, lang):
             special_tokens=["[UNK]", "[PAD]", "[CLS]", "[SEP]", "[MASK]"],
             min_frequency=2
         )
-        tokenizer.train_from_iterator(
-            get_all_sentences(ds, lang),
-            trainer=trainer
-        )
+        tokenizer.train_from_iterator(get_all_sentences(ds, lang), trainer=trainer)
         tokenizer.save(str(tokenizer_path))
     return Tokenizer.from_file(str(tokenizer_path))
 
-def get_ds(lang_src="ta", lang_tgt="en"):
-    try:
-        ds_raw = load_dataset("opus_books", lang_src + "-" + lang_tgt)
-        ds = ds_raw["train"]
-        if len(ds) == 0:
-            raise ValueError("Empty dataset")
-        return ds, lang_src, lang_tgt
-    except:
-        print(f"Dataset for {lang_src}-{lang_tgt} not found. Using de-en instead.")
-        ds_raw = load_dataset("opus_books", "de-en")
-        return ds_raw["train"], "de", "en"
+def get_ds(lang_src, lang_tgt, val_split=0.1):
+    ds_raw = load_dataset("opus_books", f"{lang_src}-{lang_tgt}")
+    ds = ds_raw["train"]
+    split = ds.train_test_split(test_size=val_split, seed=42)
+    return split["train"], split["test"], lang_src, lang_tgt
 
 def encode_sentence(tokenizer, text, seq_len):
-    tokens = tokenizer.encode(text).ids
-    if len(tokens) < seq_len:
-        tokens = tokens + [tokenizer.token_to_id("[PAD]")] * (seq_len - len(tokens))
+    ids = tokenizer.encode(text).ids
+    pad_id = tokenizer.token_to_id("[PAD]")
+    if len(ids) < seq_len:
+        ids += [pad_id] * (seq_len - len(ids))
     else:
-        tokens = tokens[:seq_len]
-    return torch.tensor(tokens, dtype=torch.long)
+        ids = ids[:seq_len]
+    return torch.tensor(ids, dtype=torch.long)
 
-# creates src-tgt pairs
 class TranslationDataset(torch.utils.data.Dataset):
     def __init__(self, ds, tok_src, tok_tgt, src_lang, tgt_lang, seq_len):
         self.ds = ds
@@ -65,42 +62,29 @@ class TranslationDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         item = self.ds[idx]
-        src_text = item["translation"][self.src_lang]
-        tgt_text = item["translation"][self.tgt_lang]
+        src = encode_sentence(self.tok_src, item["translation"][self.src_lang], self.seq_len)
+        tgt = encode_sentence(self.tok_tgt, item["translation"][self.tgt_lang], self.seq_len)
+        return src, tgt
 
-        src_tokens = encode_sentence(self.tok_src, src_text, self.seq_len)
-        tgt_tokens = encode_sentence(self.tok_tgt, tgt_text, self.seq_len)
-
-        return src_tokens, tgt_tokens
-    
 def create_padding_mask(seq, pad_id):
-    # seq: (batch, seq_len)
     return (seq != pad_id).unsqueeze(1).unsqueeze(2)
 
 def create_tgt_mask(tgt, pad_id):
     batch, seq_len = tgt.shape
-
-    pad_mask = create_padding_mask(tgt, pad_id)  # (batch,1,1,seq)
-    causal = torch.tril(torch.ones((seq_len, seq_len))).bool()
-    causal = causal.unsqueeze(0).unsqueeze(1)     # (1,1,seq,seq)
+    pad_mask = create_padding_mask(tgt, pad_id)
+    causal = torch.tril(torch.ones(seq_len, seq_len)).bool()
+    causal = causal.unsqueeze(0).unsqueeze(1)
     return pad_mask & causal
 
 def build_language_transformer(lang_src, lang_tgt, seq_len=64):
-    # Load raw dataset
-    ds, src_key, tgt_key = get_ds(lang_src, lang_tgt)
+    train_ds, val_ds, src_key, tgt_key = get_ds(lang_src, lang_tgt)
 
-    # Load or create tokenizer
-    tok_src = get_or_create_tokenizer(f"{lang_src}_tokenizer.json", ds, src_key)
-    tok_tgt = get_or_create_tokenizer(f"{lang_tgt}_tokenizer.json", ds, tgt_key)
+    tok_src = get_or_create_tokenizer(f"tokenizers/{lang_src}_tokenizer.json", train_ds, src_key)
+    tok_tgt = get_or_create_tokenizer(f"tokenizers/{lang_tgt}_tokenizer.json", train_ds, tgt_key)
 
-    # Build vocab sizes
-    src_vocab = tok_src.get_vocab_size()
-    tgt_vocab = tok_tgt.get_vocab_size()
-
-    # Build transformer model
     model = build_transformer(
-        src_vocab_size=src_vocab,
-        tgt_vocab_size=tgt_vocab,
+        src_vocab_size=tok_src.get_vocab_size(),
+        tgt_vocab_size=tok_tgt.get_vocab_size(),
         src_seq_len=seq_len,
         tgt_seq_len=seq_len,
         d_model=256,
@@ -108,63 +92,92 @@ def build_language_transformer(lang_src, lang_tgt, seq_len=64):
         h=4,
         dropout=0.1,
         d_ff=512
+    ).to(device)
+
+    train_loader = torch.utils.data.DataLoader(
+        TranslationDataset(train_ds, tok_src, tok_tgt, src_key, tgt_key, seq_len),
+        batch_size=16, shuffle=True
     )
 
-    # Build dataset + dataloader
-    dataset = TranslationDataset(ds, tok_src, tok_tgt, src_key, tgt_key, seq_len)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=16, shuffle=True)
+    val_loader = torch.utils.data.DataLoader(
+        TranslationDataset(val_ds, tok_src, tok_tgt, src_key, tgt_key, seq_len),
+        batch_size=16
+    )
 
-    return model, tok_src, tok_tgt, loader
+    return model, tok_src, tok_tgt, train_loader, val_loader
 
-def train_one_epoch(model, data_loader, optimizer, tok_tgt, device):
-
-    PAD = tok_tgt.token_to_id("[PAD]")
+def train_one_epoch(model, loader, optimizer, tok_tgt):
     model.train()
-
+    pad_id = tok_tgt.token_to_id("[PAD]")
     total_loss = 0
 
-    for src, tgt in data_loader:
-        src = src.to(device)
-        tgt = tgt.to(device)
+    for src, tgt in loader:
+        src, tgt = src.to(device), tgt.to(device)
+        tgt_in, tgt_out = tgt[:, :-1], tgt[:, 1:]
 
-        tgt_input = tgt[:, :-1]
-        tgt_output = tgt[:, 1:]
+        src_mask = create_padding_mask(src, pad_id).to(device)
+        tgt_mask = create_tgt_mask(tgt_in, pad_id).to(device)
 
-        src_mask = create_padding_mask(src, PAD).to(device)
-        tgt_mask = create_tgt_mask(tgt_input, PAD).to(device)
+        enc = model.encode(src, src_mask)
+        dec = model.decode(enc, src_mask, tgt_in, tgt_mask)
+        logits = model.project(dec)
 
-        encoder_output = model.encode(src, src_mask)
-        decoder_output = model.decode(encoder_output, src_mask, tgt_input, tgt_mask)
-        logits = model.project(decoder_output)
-
-        loss = nn.CrossEntropyLoss(ignore_index=PAD)(
+        loss = nn.CrossEntropyLoss(ignore_index=pad_id)(
             logits.reshape(-1, logits.size(-1)),
-            tgt_output.reshape(-1)
+            tgt_out.reshape(-1)
         )
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-
         total_loss += loss.item()
 
-    return total_loss / len(data_loader)
+    return total_loss / len(loader)
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+def evaluate_bleu(model, loader, tok_src, tok_tgt):
+    model.eval()
+    pad_id = tok_tgt.token_to_id("[PAD]")
+    scores = []
 
-# Tamil transformer
-model_ta, tok_ta_src, tok_ta_tgt, loader_ta = build_language_transformer("ta", "en")
-model_ta.to(device)
-opt_ta = torch.optim.Adam(model_ta.parameters(), lr=1e-4)
+    with torch.no_grad():
+        for src, tgt in loader:
+            src, tgt = src.to(device), tgt.to(device)
+            src_mask = create_padding_mask(src, pad_id).to(device)
 
-# Telugu transformer
-model_te, tok_te_src, tok_te_tgt, loader_te = build_language_transformer("te", "en")
-model_te.to(device)
-opt_te = torch.optim.Adam(model_te.parameters(), lr=1e-4)
+            enc = model.encode(src, src_mask)
+            dec = model.decode(enc, src_mask, tgt[:, :-1], None)
+            preds = model.project(dec).argmax(dim=-1)
 
-# Train for a few epochs each
-for epoch in range(5):
-    loss_ta = train_one_epoch(model_ta, loader_ta, opt_ta, tok_ta_tgt, device)
-    loss_te = train_one_epoch(model_te, loader_te, opt_te, tok_te_tgt, device)
+            for i in range(src.size(0)):
+                hyp = [t for t in preds[i].tolist() if t != pad_id]
+                ref = [[t for t in tgt[i].tolist() if t != pad_id]]
+                scores.append(sentence_bleu(ref, hyp, smoothing_function=bleu_smoother))
 
-    print(f"Epoch {epoch+1} | Tamil Loss: {loss_ta:.3f} | Telugu Loss: {loss_te:.3f}")
+    return sum(scores) / max(len(scores), 1)
+
+# build models
+model_ca, tok_ca_src, tok_ca_tgt, loader_ca_tr, loader_ca_val = build_language_transformer("ca", "en")
+model_de, tok_de_src, tok_de_tgt, loader_de_tr, loader_de_val = build_language_transformer("de", "en")
+
+opt_ca = torch.optim.Adam(model_ca.parameters(), lr=1e-4)
+opt_de = torch.optim.Adam(model_de.parameters(), lr=1e-4)
+
+epochs = 20
+
+for epoch in range(epochs):
+    loss_ca = train_one_epoch(model_ca, loader_ca_tr, opt_ca, tok_ca_tgt)
+    loss_de = train_one_epoch(model_de, loader_de_tr, opt_de, tok_de_tgt)
+
+    bleu_ca = evaluate_bleu(model_ca, loader_ca_val, tok_ca_src, tok_ca_tgt)
+    bleu_de = evaluate_bleu(model_de, loader_de_val, tok_de_src, tok_de_tgt)
+
+    print(
+        f"Epoch {epoch+1:02d} | "
+        f"CA Loss: {loss_ca:.3f} | DE Loss: {loss_de:.3f} | "
+        f"CA BLEU: {bleu_ca:.3f} | DE BLEU: {bleu_de:.3f}"
+    )
+
+torch.save(model_ca.state_dict(), "models/transformer_ca_en.pth")
+torch.save(model_de.state_dict(), "models/transformer_de_en.pth")
+
+print("Models saved to models/")
