@@ -1,183 +1,288 @@
+import math
+import random
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-from pathlib import Path
-from datasets import load_dataset
+import torch.optim as optim
+from torch.utils.data import DataLoader
+
+from datasets import load_dataset, concatenate_datasets
 from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import Whitespace
-from tokenizers.trainers import WordLevelTrainer
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from model import build_transformer
 
-# ensure directories exist
-Path("models").mkdir(exist_ok=True)
-Path("tokenizers").mkdir(exist_ok=True)
+from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-bleu_smoother = SmoothingFunction().method1
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def get_all_sentences(ds, lang):
-    for item in ds:
-        yield item["translation"][lang]
+random.seed(42)
+torch.manual_seed(42)
 
-def get_or_create_tokenizer(tokenizer_path, ds, lang):
-    tokenizer_path = Path(tokenizer_path)
-    if not tokenizer_path.exists():
-        tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
-        tokenizer.pre_tokenizer = Whitespace()
-        trainer = WordLevelTrainer(
-            special_tokens=["[UNK]", "[PAD]", "[CLS]", "[SEP]", "[MASK]"],
-            min_frequency=2
-        )
-        tokenizer.train_from_iterator(get_all_sentences(ds, lang), trainer=trainer)
-        tokenizer.save(str(tokenizer_path))
-    return Tokenizer.from_file(str(tokenizer_path))
+MAX_LEN = 64
+BATCH_SIZE = 64
+EPOCHS = 120
+VOCAB_SIZE = 16000
+WARMUP_STEPS = 4000
 
-def get_ds(lang_src, lang_tgt, val_split=0.1):
-    ds_raw = load_dataset("opus_books", f"{lang_src}-{lang_tgt}")
-    ds = ds_raw["train"]
-    split = ds.train_test_split(test_size=val_split, seed=42)
-    return split["train"], split["test"], lang_src, lang_tgt
+PAD = "<pad>"
+SOS = "<sos>"
+EOS = "<eos>"
+UNK = "<unk>"
+CA = "<ca>"
+DE = "<de>"
 
-def encode_sentence(tokenizer, text, seq_len):
-    ids = tokenizer.encode(text).ids
-    pad_id = tokenizer.token_to_id("[PAD]")
-    if len(ids) < seq_len:
-        ids += [pad_id] * (seq_len - len(ids))
-    else:
-        ids = ids[:seq_len]
-    return torch.tensor(ids, dtype=torch.long)
+BASE_DIR = Path(".")
+MODEL_DIR = BASE_DIR / "models"
+TOKENIZER_DIR = BASE_DIR / "tokenizers"
+CKPT_DIR = BASE_DIR / "checkpoints"
+
+MODEL_DIR.mkdir(exist_ok=True)
+TOKENIZER_DIR.mkdir(exist_ok=True)
+CKPT_DIR.mkdir(exist_ok=True)
+
+def train_bpe(path, texts):
+    tok = Tokenizer(BPE(unk_token=UNK))
+    tok.pre_tokenizer = Whitespace()
+    trainer = BpeTrainer(
+        vocab_size=VOCAB_SIZE,
+        special_tokens=[PAD, SOS, EOS, UNK, CA, DE]
+    )
+    tok.train_from_iterator(texts, trainer)
+    tok.save(str(path))
+    return tok
+
+def get_tokenizer(path, dataset, lang):
+    if path.exists():
+        return Tokenizer.from_file(str(path))
+    texts = (ex["translation"][lang] for ex in dataset)
+    return train_bpe(path, texts)
+
+def encode(tok, text, lang_token):
+    ids = tok.encode(text).ids[: MAX_LEN - 3]
+    return [
+        tok.token_to_id(SOS),
+        tok.token_to_id(lang_token),
+        *ids,
+        tok.token_to_id(EOS)
+    ]
 
 class TranslationDataset(torch.utils.data.Dataset):
-    def __init__(self, ds, tok_src, tok_tgt, src_lang, tgt_lang, seq_len):
-        self.ds = ds
+    def __init__(self, data, tok_src, tok_tgt):
+        self.data = data
         self.tok_src = tok_src
         self.tok_tgt = tok_tgt
-        self.src_lang = src_lang
-        self.tgt_lang = tgt_lang
-        self.seq_len = seq_len
 
     def __len__(self):
-        return len(self.ds)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        item = self.ds[idx]
-        src = encode_sentence(self.tok_src, item["translation"][self.src_lang], self.seq_len)
-        tgt = encode_sentence(self.tok_tgt, item["translation"][self.tgt_lang], self.seq_len)
-        return src, tgt
+        ex = self.data[idx]["translation"]
+        if "ca" in ex:
+            src = encode(self.tok_src, ex["ca"], CA)
+        else:
+            src = encode(self.tok_src, ex["de"], DE)
 
-def create_padding_mask(seq, pad_id):
-    return (seq != pad_id).unsqueeze(1).unsqueeze(2)
+        tgt = encode(self.tok_tgt, ex["en"], SOS)
+        return torch.tensor(src), torch.tensor(tgt)
 
-def create_tgt_mask(tgt, pad_id):
-    batch, seq_len = tgt.shape
-    pad_mask = create_padding_mask(tgt, pad_id)
-    causal = torch.tril(torch.ones(seq_len, seq_len)).bool()
-    causal = causal.unsqueeze(0).unsqueeze(1)
-    return pad_mask & causal
+def collate(batch):
+    src, tgt = zip(*batch)
+    src = nn.utils.rnn.pad_sequence(src, padding_value=0)
+    tgt = nn.utils.rnn.pad_sequence(tgt, padding_value=0)
+    return src.to(DEVICE), tgt.to(DEVICE)
 
-def build_language_transformer(lang_src, lang_tgt, seq_len=64):
-    train_ds, val_ds, src_key, tgt_key = get_ds(lang_src, lang_tgt)
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=512):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(max_len).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe.unsqueeze(1))
 
-    tok_src = get_or_create_tokenizer(f"tokenizers/{lang_src}_tokenizer.json", train_ds, src_key)
-    tok_tgt = get_or_create_tokenizer(f"tokenizers/{lang_tgt}_tokenizer.json", train_ds, tgt_key)
+    def forward(self, x):
+        return x + self.pe[: x.size(0)]
 
-    model = build_transformer(
-        src_vocab_size=tok_src.get_vocab_size(),
-        tgt_vocab_size=tok_tgt.get_vocab_size(),
-        src_seq_len=seq_len,
-        tgt_seq_len=seq_len,
-        d_model=256,
-        N=4,
-        h=4,
-        dropout=0.1,
-        d_ff=512
-    ).to(device)
+class MultilingualTransformer(nn.Module):
+    def __init__(self, src_vocab, tgt_vocab, d_model=512, heads=8, layers=6):
+        super().__init__()
+        self.src_emb = nn.Embedding(src_vocab, d_model)
+        self.tgt_emb = nn.Embedding(tgt_vocab, d_model)
+        self.pos = PositionalEncoding(d_model)
 
-    train_loader = torch.utils.data.DataLoader(
-        TranslationDataset(train_ds, tok_src, tok_tgt, src_key, tgt_key, seq_len),
-        batch_size=16, shuffle=True
-    )
-
-    val_loader = torch.utils.data.DataLoader(
-        TranslationDataset(val_ds, tok_src, tok_tgt, src_key, tgt_key, seq_len),
-        batch_size=16
-    )
-
-    return model, tok_src, tok_tgt, train_loader, val_loader
-
-def train_one_epoch(model, loader, optimizer, tok_tgt):
-    model.train()
-    pad_id = tok_tgt.token_to_id("[PAD]")
-    total_loss = 0
-
-    for src, tgt in loader:
-        src, tgt = src.to(device), tgt.to(device)
-        tgt_in, tgt_out = tgt[:, :-1], tgt[:, 1:]
-
-        src_mask = create_padding_mask(src, pad_id).to(device)
-        tgt_mask = create_tgt_mask(tgt_in, pad_id).to(device)
-
-        enc = model.encode(src, src_mask)
-        dec = model.decode(enc, src_mask, tgt_in, tgt_mask)
-        logits = model.project(dec)
-
-        loss = nn.CrossEntropyLoss(ignore_index=pad_id)(
-            logits.reshape(-1, logits.size(-1)),
-            tgt_out.reshape(-1)
+        self.transformer = nn.Transformer(
+            d_model=d_model,
+            nhead=heads,
+            num_encoder_layers=layers,
+            num_decoder_layers=layers,
+            dim_feedforward=2048,
+            dropout=0.1
         )
 
+        self.fc = nn.Linear(d_model, tgt_vocab)
+        self.fc.weight = self.tgt_emb.weight
+
+    def forward(self, src, tgt, src_pad, tgt_pad):
+        src = self.pos(self.src_emb(src))
+        tgt = self.pos(self.tgt_emb(tgt))
+
+        tgt_mask = self.transformer.generate_square_subsequent_mask(
+            tgt.size(0)
+        ).to(DEVICE)
+
+        out = self.transformer(
+            src,
+            tgt,
+            tgt_mask=tgt_mask,
+            src_key_padding_mask=src_pad,
+            tgt_key_padding_mask=tgt_pad,
+            memory_key_padding_mask=src_pad
+        )
+        return self.fc(out)
+
+class LabelSmoothingLoss(nn.Module):
+    def __init__(self, vocab, pad_id, eps=0.1):
+        super().__init__()
+        self.pad = pad_id
+        self.eps = eps
+        self.vocab = vocab
+
+    def forward(self, logits, target):
+        logp = torch.log_softmax(logits, dim=-1)
+        nll = -logp.gather(-1, target.unsqueeze(1)).squeeze(1)
+        smooth = -logp.mean(dim=-1)
+        mask = target != self.pad
+        return ((1 - self.eps) * nll + self.eps * smooth)[mask].mean()
+
+class TransformerScheduler:
+    def __init__(self, opt, d_model):
+        self.opt = opt
+        self.step_num = 0
+        self.d_model = d_model
+
+    def step(self):
+        self.step_num += 1
+        lr = (self.d_model ** -0.5) * min(
+            self.step_num ** -0.5,
+            self.step_num * WARMUP_STEPS ** -1.5
+        )
+        for g in self.opt.param_groups:
+            g["lr"] = lr
+        self.opt.step()
+
+@torch.no_grad()
+def bleu_eval(model, loader, tok):
+    smooth = SmoothingFunction().method4
+    refs, hyps = [], []
+
+    for src, tgt in loader:
+        src_pad = (src == 0).transpose(0, 1)
+        ys = torch.tensor([[tok.token_to_id(SOS)]], device=DEVICE)
+
+        for _ in range(MAX_LEN):
+            tgt_pad = (ys == 0).transpose(0, 1)
+            out = model(src, ys, src_pad, tgt_pad)[-1]
+            next_tok = out.argmax(-1).item()
+            ys = torch.cat([ys, torch.tensor([[next_tok]], device=DEVICE)], 0)
+            if next_tok == tok.token_to_id(EOS):
+                break
+
+        hyp = [
+            tok.id_to_token(i)
+            for i in ys.squeeze().tolist()
+            if i not in (0, tok.token_to_id(SOS), tok.token_to_id(EOS))
+        ]
+        ref = [
+            tok.id_to_token(i)
+            for i in tgt[:, 0].tolist()
+            if i not in (0, tok.token_to_id(SOS), tok.token_to_id(EOS))
+        ]
+
+        refs.append([ref])
+        hyps.append(hyp)
+
+    return corpus_bleu(refs, hyps, smoothing_function=smooth)
+
+def save_checkpoint(epoch, model, opt, sched, scaler):
+    torch.save({
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "optimizer": opt.state_dict(),
+        "scheduler": sched.step_num,
+        "scaler": scaler.state_dict()
+    }, CKPT_DIR / "latest.pt")
+
+def load_checkpoint(model, opt, sched, scaler):
+    ckpt = CKPT_DIR / "latest.pt"
+    if not ckpt.exists():
+        return 1
+    data = torch.load(ckpt, map_location=DEVICE)
+    model.load_state_dict(data["model"])
+    opt.load_state_dict(data["optimizer"])
+    scaler.load_state_dict(data["scaler"])
+    sched.step_num = data["scheduler"]
+    return data["epoch"] + 1
+
+print("Loading datasets...")
+ca = load_dataset("opus_books", "ca-en")["train"]
+de = load_dataset("opus_books", "de-en")["train"]
+
+full = concatenate_datasets([ca, de]).train_test_split(0.1, seed=42)
+
+tok_src = get_tokenizer(TOKENIZER_DIR / "src.json", full["train"], "ca")
+tok_en = get_tokenizer(TOKENIZER_DIR / "en.json", full["train"], "en")
+
+train_ds = TranslationDataset(full["train"], tok_src, tok_en)
+val_ds = TranslationDataset(full["test"], tok_src, tok_en)
+
+train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True, collate_fn=collate)
+val_loader = DataLoader(val_ds, 1, collate_fn=collate)
+
+model = MultilingualTransformer(
+    tok_src.get_vocab_size(),
+    tok_en.get_vocab_size()
+).to(DEVICE)
+
+optimizer = optim.Adam(model.parameters(), betas=(0.9, 0.98), eps=1e-9)
+scheduler = TransformerScheduler(optimizer, 512)
+scaler = torch.cuda.amp.GradScaler()
+criterion = LabelSmoothingLoss(tok_en.get_vocab_size(), 0)
+
+start_epoch = load_checkpoint(model, optimizer, scheduler, scaler)
+
+for epoch in range(start_epoch, EPOCHS + 1):
+    model.train()
+    total = 0
+
+    for src, tgt in train_loader:
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
+        src_pad = (src == 0).transpose(0, 1)
+        tgt_pad = (tgt[:-1] == 0).transpose(0, 1)
 
-    return total_loss / len(loader)
+        with torch.cuda.amp.autocast():
+            out = model(src, tgt[:-1], src_pad, tgt_pad)
+            loss = criterion(
+                out.reshape(-1, out.size(-1)),
+                tgt[1:].reshape(-1)
+            )
 
-def evaluate_bleu(model, loader, tok_src, tok_tgt):
-    model.eval()
-    pad_id = tok_tgt.token_to_id("[PAD]")
-    scores = []
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+        total += loss.item()
 
-    with torch.no_grad():
-        for src, tgt in loader:
-            src, tgt = src.to(device), tgt.to(device)
-            src_mask = create_padding_mask(src, pad_id).to(device)
-
-            enc = model.encode(src, src_mask)
-            dec = model.decode(enc, src_mask, tgt[:, :-1], None)
-            preds = model.project(dec).argmax(dim=-1)
-
-            for i in range(src.size(0)):
-                hyp = [t for t in preds[i].tolist() if t != pad_id]
-                ref = [[t for t in tgt[i].tolist() if t != pad_id]]
-                scores.append(sentence_bleu(ref, hyp, smoothing_function=bleu_smoother))
-
-    return sum(scores) / max(len(scores), 1)
-
-# build models
-model_ca, tok_ca_src, tok_ca_tgt, loader_ca_tr, loader_ca_val = build_language_transformer("ca", "en")
-model_de, tok_de_src, tok_de_tgt, loader_de_tr, loader_de_val = build_language_transformer("de", "en")
-
-opt_ca = torch.optim.Adam(model_ca.parameters(), lr=1e-4)
-opt_de = torch.optim.Adam(model_de.parameters(), lr=1e-4)
-
-epochs = 20
-
-for epoch in range(epochs):
-    loss_ca = train_one_epoch(model_ca, loader_ca_tr, opt_ca, tok_ca_tgt)
-    loss_de = train_one_epoch(model_de, loader_de_tr, opt_de, tok_de_tgt)
-
-    bleu_ca = evaluate_bleu(model_ca, loader_ca_val, tok_ca_src, tok_ca_tgt)
-    bleu_de = evaluate_bleu(model_de, loader_de_val, tok_de_src, tok_de_tgt)
+    bleu = bleu_eval(model, val_loader, tok_en)
+    save_checkpoint(epoch, model, optimizer, scheduler, scaler)
 
     print(
-        f"Epoch {epoch+1:02d} | "
-        f"CA Loss: {loss_ca:.3f} | DE Loss: {loss_de:.3f} | "
-        f"CA BLEU: {bleu_ca:.3f} | DE BLEU: {bleu_de:.3f}"
+        f"Epoch {epoch:03d} | "
+        f"Loss {total/len(train_loader):.3f} | "
+        f"BLEU {bleu:.3f}"
     )
 
-torch.save(model_ca.state_dict(), "models/transformer_ca_en.pth")
-torch.save(model_de.state_dict(), "models/transformer_de_en.pth")
-
-print("Models saved to models/")
+torch.save(model.state_dict(), MODEL_DIR / "multilingual_ca_de_en.pt")
+print("Model and tokenizers saved. Ready for inference or deployment.")
