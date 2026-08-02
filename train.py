@@ -1,288 +1,282 @@
+"""Train the from-scratch transformer (model.py) as a seq2seq translator.
+
+One model per language pair (e.g. ca-en, de-en) on the opus_books corpus.
+Artifacts are written to models/<src>_<tgt>/ ready to be served by serve_model.py:
+
+    models/ca_en/{weights.pth, config.json, src_tokenizer.json, tgt_tokenizer.json}
+
+Usage:
+    python train.py                       # all default pairs, full run
+    QUICK_RUN=1 python train.py           # tiny smoke run (few samples / 1 epoch)
+    python train.py --pairs ca-en         # a single pair
+"""
+
+import argparse
+import json
 import math
-import random
+import os
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-
-from datasets import load_dataset, concatenate_datasets
+from datasets import load_dataset
 from tokenizers import Tokenizer
-from tokenizers.models import BPE
-from tokenizers.trainers import BpeTrainer
+from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
+from tokenizers.trainers import WordLevelTrainer
+from torch.utils.data import DataLoader, Dataset
 
-from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
+from model import build_transformer
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-random.seed(42)
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 torch.manual_seed(42)
 
-MAX_LEN = 64
-BATCH_SIZE = 64
-EPOCHS = 120
-VOCAB_SIZE = 16000
-WARMUP_STEPS = 4000
+SPECIALS = ["[PAD]", "[UNK]", "[SOS]", "[EOS]"]
+PAD_ID, UNK_ID, SOS_ID, EOS_ID = 0, 1, 2, 3
 
-PAD = "<pad>"
-SOS = "<sos>"
-EOS = "<eos>"
-UNK = "<unk>"
-CA = "<ca>"
-DE = "<de>"
+# ---- config ----
+QUICK_RUN = os.getenv("QUICK_RUN", "0") == "1"
+SEQ_LEN = int(os.getenv("SEQ_LEN", "64"))
+D_MODEL = int(os.getenv("D_MODEL", "256"))
+N_LAYERS = int(os.getenv("N_LAYERS", "4"))
+N_HEADS = int(os.getenv("N_HEADS", "8"))
+D_FF = int(os.getenv("D_FF", "512"))
+DROPOUT = float(os.getenv("DROPOUT", "0.1"))
+VOCAB_SIZE = int(os.getenv("VOCAB_SIZE", "16000"))
+MIN_FREQ = int(os.getenv("MIN_FREQ", "2"))
 
-BASE_DIR = Path(".")
-MODEL_DIR = BASE_DIR / "models"
-TOKENIZER_DIR = BASE_DIR / "tokenizers"
-CKPT_DIR = BASE_DIR / "checkpoints"
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "32"))
+EPOCHS = int(os.getenv("EPOCHS", "20"))
+LR = float(os.getenv("LR", "1e-3"))
+WARMUP_STEPS = int(os.getenv("WARMUP_STEPS", "2000"))
+LABEL_SMOOTHING = float(os.getenv("LABEL_SMOOTHING", "0.1"))
+MAX_GRAD_NORM = 1.0
 
-MODEL_DIR.mkdir(exist_ok=True)
-TOKENIZER_DIR.mkdir(exist_ok=True)
-CKPT_DIR.mkdir(exist_ok=True)
+if QUICK_RUN:
+    BATCH_SIZE = min(BATCH_SIZE, 16)
 
-def train_bpe(path, texts):
-    tok = Tokenizer(BPE(unk_token=UNK))
+DEFAULT_PAIRS = ["ca-en", "de-en"]
+OPUS_KEY = {"ca": "ca", "de": "de", "en": "en"}
+
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
+
+
+def build_tokenizer(texts: List[str]) -> Tokenizer:
+    tok = Tokenizer(WordLevel(unk_token="[UNK]"))
     tok.pre_tokenizer = Whitespace()
-    trainer = BpeTrainer(
-        vocab_size=VOCAB_SIZE,
-        special_tokens=[PAD, SOS, EOS, UNK, CA, DE]
-    )
-    tok.train_from_iterator(texts, trainer)
-    tok.save(str(path))
+    trainer = WordLevelTrainer(vocab_size=VOCAB_SIZE, min_frequency=MIN_FREQ, special_tokens=SPECIALS)
+    tok.train_from_iterator(texts, trainer=trainer)
     return tok
 
-def get_tokenizer(path, dataset, lang):
-    if path.exists():
-        return Tokenizer.from_file(str(path))
-    texts = (ex["translation"][lang] for ex in dataset)
-    return train_bpe(path, texts)
 
-def encode(tok, text, lang_token):
-    ids = tok.encode(text).ids[: MAX_LEN - 3]
-    return [
-        tok.token_to_id(SOS),
-        tok.token_to_id(lang_token),
-        *ids,
-        tok.token_to_id(EOS)
-    ]
+def encode(tok: Tokenizer, text: str) -> List[int]:
+    ids = tok.encode(text).ids[: SEQ_LEN - 2]
+    return [SOS_ID] + ids + [EOS_ID]
 
-class TranslationDataset(torch.utils.data.Dataset):
-    def __init__(self, data, tok_src, tok_tgt):
-        self.data = data
-        self.tok_src = tok_src
-        self.tok_tgt = tok_tgt
 
-    def __len__(self):
-        return len(self.data)
+def pad_to_seq(ids: List[int]) -> List[int]:
+    ids = ids[:SEQ_LEN]
+    return ids + [PAD_ID] * (SEQ_LEN - len(ids))
 
-    def __getitem__(self, idx):
-        ex = self.data[idx]["translation"]
-        if "ca" in ex:
-            src = encode(self.tok_src, ex["ca"], CA)
-        else:
-            src = encode(self.tok_src, ex["de"], DE)
 
-        tgt = encode(self.tok_tgt, ex["en"], SOS)
-        return torch.tensor(src), torch.tensor(tgt)
+class PairDataset(Dataset):
+    def __init__(self, rows: List[Dict[str, str]], src_tok: Tokenizer, tgt_tok: Tokenizer):
+        self.rows = rows
+        self.src_tok = src_tok
+        self.tgt_tok = tgt_tok
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, i: int):
+        row = self.rows[i]
+        src = pad_to_seq(encode(self.src_tok, row["src"]))
+        tgt_full = encode(self.tgt_tok, row["tgt"])[:SEQ_LEN]
+        decoder_input = pad_to_seq(tgt_full[:-1])
+        label = pad_to_seq(tgt_full[1:])
+        return {
+            "encoder_input": torch.tensor(src, dtype=torch.long),
+            "decoder_input": torch.tensor(decoder_input, dtype=torch.long),
+            "label": torch.tensor(label, dtype=torch.long),
+        }
+
+
+def causal_mask(size: int) -> torch.Tensor:
+    return torch.tril(torch.ones(1, size, size)).int()
+
 
 def collate(batch):
-    src, tgt = zip(*batch)
-    src = nn.utils.rnn.pad_sequence(src, padding_value=0)
-    tgt = nn.utils.rnn.pad_sequence(tgt, padding_value=0)
-    return src.to(DEVICE), tgt.to(DEVICE)
+    enc = torch.stack([b["encoder_input"] for b in batch])
+    dec = torch.stack([b["decoder_input"] for b in batch])
+    label = torch.stack([b["label"] for b in batch])
+    src_mask = (enc != PAD_ID).unsqueeze(1).unsqueeze(1).int()
+    tgt_pad = (dec != PAD_ID).unsqueeze(1).unsqueeze(1).int()
+    tgt_mask = tgt_pad & causal_mask(dec.size(1))
+    return enc, dec, label, src_mask, tgt_mask
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=512):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        pos = torch.arange(max_len).unsqueeze(1)
-        div = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        self.register_buffer("pe", pe.unsqueeze(1))
 
-    def forward(self, x):
-        return x + self.pe[: x.size(0)]
+def load_pair_rows(pair: str) -> List[Dict[str, str]]:
+    src_lang, tgt_lang = pair.split("-")
+    ds = load_dataset("opus_books", pair)["train"]
+    rows = []
+    for ex in ds:
+        s = ex["translation"].get(OPUS_KEY[src_lang], "")
+        t = ex["translation"].get(OPUS_KEY[tgt_lang], "")
+        if s and t:
+            rows.append({"src": s, "tgt": t})
+    return rows
 
-class MultilingualTransformer(nn.Module):
-    def __init__(self, src_vocab, tgt_vocab, d_model=512, heads=8, layers=6):
-        super().__init__()
-        self.src_emb = nn.Embedding(src_vocab, d_model)
-        self.tgt_emb = nn.Embedding(tgt_vocab, d_model)
-        self.pos = PositionalEncoding(d_model)
 
-        self.transformer = nn.Transformer(
-            d_model=d_model,
-            nhead=heads,
-            num_encoder_layers=layers,
-            num_decoder_layers=layers,
-            dim_feedforward=2048,
-            dropout=0.1
-        )
+def split_rows(rows: List[Dict[str, str]]) -> Tuple[list, list, list]:
+    g = torch.Generator().manual_seed(42)
+    perm = torch.randperm(len(rows), generator=g).tolist()
+    rows = [rows[i] for i in perm]
+    n = len(rows)
+    n_test = max(1, int(n * 0.05))
+    n_val = max(1, int(n * 0.05))
+    return rows[n_test + n_val:], rows[:n_val], rows[n_val:n_val + n_test]
 
-        self.fc = nn.Linear(d_model, tgt_vocab)
-        self.fc.weight = self.tgt_emb.weight
 
-    def forward(self, src, tgt, src_pad, tgt_pad):
-        src = self.pos(self.src_emb(src))
-        tgt = self.pos(self.tgt_emb(tgt))
+def make_lr_lambda(warmup: int):
+    def lr_lambda(step: int) -> float:
+        step = max(1, step)
+        return min(step / warmup, (warmup / step) ** 0.5)
+    return lr_lambda
 
-        tgt_mask = self.transformer.generate_square_subsequent_mask(
-            tgt.size(0)
-        ).to(DEVICE)
 
-        out = self.transformer(
-            src,
-            tgt,
-            tgt_mask=tgt_mask,
-            src_key_padding_mask=src_pad,
-            tgt_key_padding_mask=tgt_pad,
-            memory_key_padding_mask=src_pad
-        )
-        return self.fc(out)
+@torch.inference_mode()
+def greedy_translate(model, src_tok, tgt_tok, text: str) -> str:
+    model.eval()
+    ids = torch.tensor([pad_to_seq(encode(src_tok, text))], device=DEVICE)
+    src_mask = (ids != PAD_ID).unsqueeze(1).unsqueeze(1).int()
+    enc = model.encode(ids, src_mask)
+    ys = torch.tensor([[SOS_ID]], device=DEVICE)
+    for _ in range(SEQ_LEN):
+        out = model.decode(enc, src_mask, ys, causal_mask(ys.size(1)).to(DEVICE))
+        nxt = int(model.project(out[:, -1]).argmax(-1).item())
+        ys = torch.cat([ys, torch.tensor([[nxt]], device=DEVICE)], dim=1)
+        if nxt == EOS_ID:
+            break
+    toks = [t for t in ys[0].tolist() if t not in (SOS_ID, EOS_ID, PAD_ID)]
+    return tgt_tok.decode(toks).strip()
 
-class LabelSmoothingLoss(nn.Module):
-    def __init__(self, vocab, pad_id, eps=0.1):
-        super().__init__()
-        self.pad = pad_id
-        self.eps = eps
-        self.vocab = vocab
 
-    def forward(self, logits, target):
-        logp = torch.log_softmax(logits, dim=-1)
-        nll = -logp.gather(-1, target.unsqueeze(1)).squeeze(1)
-        smooth = -logp.mean(dim=-1)
-        mask = target != self.pad
-        return ((1 - self.eps) * nll + self.eps * smooth)[mask].mean()
+def evaluate_bleu(model, rows, src_tok, tgt_tok, limit: int) -> Dict[str, float]:
+    try:
+        import evaluate
+        bleu = evaluate.load("sacrebleu")
+        chrf = evaluate.load("chrf")
+    except Exception as exc:  # metrics optional; don't fail training
+        print(f"[metrics] skipped ({exc})")
+        return {}
+    preds, refs = [], []
+    for row in rows[:limit]:
+        preds.append(greedy_translate(model, src_tok, tgt_tok, row["src"]))
+        refs.append([row["tgt"]])
+    scores = {
+        "bleu": round(bleu.compute(predictions=preds, references=refs)["score"], 2),
+        "chrf": round(chrf.compute(predictions=preds, references=[r[0] for r in refs])["score"], 2),
+    }
+    return scores
 
-class TransformerScheduler:
-    def __init__(self, opt, d_model):
-        self.opt = opt
-        self.step_num = 0
-        self.d_model = d_model
 
-    def step(self):
-        self.step_num += 1
-        lr = (self.d_model ** -0.5) * min(
-            self.step_num ** -0.5,
-            self.step_num * WARMUP_STEPS ** -1.5
-        )
-        for g in self.opt.param_groups:
-            g["lr"] = lr
-        self.opt.step()
+def train_pair(pair: str, out_root: Path) -> Dict[str, object]:
+    src_lang, tgt_lang = pair.split("-")
+    print(f"\n=== Training {pair} on {DEVICE} (QUICK_RUN={QUICK_RUN}) ===")
 
-@torch.no_grad()
-def bleu_eval(model, loader, tok):
-    smooth = SmoothingFunction().method4
-    refs, hyps = [], []
+    rows = load_pair_rows(pair)
+    if QUICK_RUN:
+        rows = rows[: int(os.getenv("QUICK_SAMPLES", "1500"))]
+    train_rows, val_rows, test_rows = split_rows(rows)
+    print(f"rows: train={len(train_rows)} val={len(val_rows)} test={len(test_rows)}")
 
-    for src, tgt in loader:
-        src_pad = (src == 0).transpose(0, 1)
-        ys = torch.tensor([[tok.token_to_id(SOS)]], device=DEVICE)
+    src_tok = build_tokenizer([r["src"] for r in train_rows])
+    tgt_tok = build_tokenizer([r["tgt"] for r in train_rows])
+    src_vocab, tgt_vocab = src_tok.get_vocab_size(), tgt_tok.get_vocab_size()
+    print(f"vocab: src={src_vocab} tgt={tgt_vocab}")
 
-        for _ in range(MAX_LEN):
-            tgt_pad = (ys == 0).transpose(0, 1)
-            out = model(src, ys, src_pad, tgt_pad)[-1]
-            next_tok = out.argmax(-1).item()
-            ys = torch.cat([ys, torch.tensor([[next_tok]], device=DEVICE)], 0)
-            if next_tok == tok.token_to_id(EOS):
-                break
-
-        hyp = [
-            tok.id_to_token(i)
-            for i in ys.squeeze().tolist()
-            if i not in (0, tok.token_to_id(SOS), tok.token_to_id(EOS))
-        ]
-        ref = [
-            tok.id_to_token(i)
-            for i in tgt[:, 0].tolist()
-            if i not in (0, tok.token_to_id(SOS), tok.token_to_id(EOS))
-        ]
-
-        refs.append([ref])
-        hyps.append(hyp)
-
-    return corpus_bleu(refs, hyps, smoothing_function=smooth)
-
-def save_checkpoint(epoch, model, opt, sched, scaler):
-    torch.save({
-        "epoch": epoch,
-        "model": model.state_dict(),
-        "optimizer": opt.state_dict(),
-        "scheduler": sched.step_num,
-        "scaler": scaler.state_dict()
-    }, CKPT_DIR / "latest.pt")
-
-def load_checkpoint(model, opt, sched, scaler):
-    ckpt = CKPT_DIR / "latest.pt"
-    if not ckpt.exists():
-        return 1
-    data = torch.load(ckpt, map_location=DEVICE)
-    model.load_state_dict(data["model"])
-    opt.load_state_dict(data["optimizer"])
-    scaler.load_state_dict(data["scaler"])
-    sched.step_num = data["scheduler"]
-    return data["epoch"] + 1
-
-print("Loading datasets...")
-ca = load_dataset("opus_books", "ca-en")["train"]
-de = load_dataset("opus_books", "de-en")["train"]
-
-full = concatenate_datasets([ca, de]).train_test_split(0.1, seed=42)
-
-tok_src = get_tokenizer(TOKENIZER_DIR / "src.json", full["train"], "ca")
-tok_en = get_tokenizer(TOKENIZER_DIR / "en.json", full["train"], "en")
-
-train_ds = TranslationDataset(full["train"], tok_src, tok_en)
-val_ds = TranslationDataset(full["test"], tok_src, tok_en)
-
-train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True, collate_fn=collate)
-val_loader = DataLoader(val_ds, 1, collate_fn=collate)
-
-model = MultilingualTransformer(
-    tok_src.get_vocab_size(),
-    tok_en.get_vocab_size()
-).to(DEVICE)
-
-optimizer = optim.Adam(model.parameters(), betas=(0.9, 0.98), eps=1e-9)
-scheduler = TransformerScheduler(optimizer, 512)
-scaler = torch.cuda.amp.GradScaler()
-criterion = LabelSmoothingLoss(tok_en.get_vocab_size(), 0)
-
-start_epoch = load_checkpoint(model, optimizer, scheduler, scaler)
-
-for epoch in range(start_epoch, EPOCHS + 1):
-    model.train()
-    total = 0
-
-    for src, tgt in train_loader:
-        optimizer.zero_grad()
-        src_pad = (src == 0).transpose(0, 1)
-        tgt_pad = (tgt[:-1] == 0).transpose(0, 1)
-
-        with torch.cuda.amp.autocast():
-            out = model(src, tgt[:-1], src_pad, tgt_pad)
-            loss = criterion(
-                out.reshape(-1, out.size(-1)),
-                tgt[1:].reshape(-1)
-            )
-
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
-        total += loss.item()
-
-    bleu = bleu_eval(model, val_loader, tok_en)
-    save_checkpoint(epoch, model, optimizer, scheduler, scaler)
-
-    print(
-        f"Epoch {epoch:03d} | "
-        f"Loss {total/len(train_loader):.3f} | "
-        f"BLEU {bleu:.3f}"
+    loader = DataLoader(
+        PairDataset(train_rows, src_tok, tgt_tok),
+        batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate,
+        num_workers=0, drop_last=False,
     )
 
-torch.save(model.state_dict(), MODEL_DIR / "multilingual_ca_de_en.pt")
-print("Model and tokenizers saved. Ready for inference or deployment.")
+    model = build_transformer(src_vocab, tgt_vocab, SEQ_LEN, SEQ_LEN,
+                              d_model=D_MODEL, N=N_LAYERS, h=N_HEADS,
+                              dropout=DROPOUT, d_ff=D_FF).to(DEVICE)
+    steps_per_epoch = max(1, math.ceil(len(train_rows) / BATCH_SIZE))
+    total_steps = EPOCHS * steps_per_epoch
+    warmup = max(1, min(WARMUP_STEPS, total_steps // 10))
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, betas=(0.9, 0.98), eps=1e-9)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, make_lr_lambda(warmup))
+    loss_fn = nn.CrossEntropyLoss(ignore_index=PAD_ID, label_smoothing=LABEL_SMOOTHING)
+
+    step = 0
+    for epoch in range(EPOCHS):
+        model.train()
+        running = 0.0
+        for enc, dec, label, src_mask, tgt_mask in loader:
+            enc, dec, label = enc.to(DEVICE), dec.to(DEVICE), label.to(DEVICE)
+            src_mask, tgt_mask = src_mask.to(DEVICE), tgt_mask.to(DEVICE)
+
+            encoder_output = model.encode(enc, src_mask)
+            decoder_output = model.decode(encoder_output, src_mask, dec, tgt_mask)
+            logits = model.project(decoder_output)
+            loss = loss_fn(logits.view(-1, tgt_vocab), label.view(-1))
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+            optimizer.step()
+            scheduler.step()
+            step += 1
+            running += loss.item()
+        avg = running / max(1, len(loader))
+        print(f"epoch {epoch + 1}/{EPOCHS}  loss={avg:.4f}  lr={scheduler.get_last_lr()[0]:.2e}")
+
+    out_dir = out_root / f"{src_lang}_{tgt_lang}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), out_dir / "weights.pth")
+    src_tok.save(str(out_dir / "src_tokenizer.json"))
+    tgt_tok.save(str(out_dir / "tgt_tokenizer.json"))
+
+    eval_limit = 50 if QUICK_RUN else 500
+    metrics = evaluate_bleu(model, test_rows, src_tok, tgt_tok, eval_limit)
+
+    config = {
+        "src_lang": src_lang, "tgt_lang": tgt_lang,
+        "d_model": D_MODEL, "N": N_LAYERS, "h": N_HEADS, "d_ff": D_FF, "dropout": DROPOUT,
+        "seq_len": SEQ_LEN, "src_vocab_size": src_vocab, "tgt_vocab_size": tgt_vocab,
+        "pad_id": PAD_ID, "sos_id": SOS_ID, "eos_id": EOS_ID,
+        "weights": "weights.pth",
+        "src_tokenizer": "src_tokenizer.json", "tgt_tokenizer": "tgt_tokenizer.json",
+        "metrics": metrics,
+    }
+    (out_dir / "config.json").write_text(json.dumps(config, indent=2))
+    print(f"saved -> {out_dir}  metrics={metrics}")
+
+    sample = test_rows[0]["src"] if test_rows else "El teu text aquí"
+    print(f"sample {src_lang}->{tgt_lang}: {sample!r} => {greedy_translate(model, src_tok, tgt_tok, sample)!r}")
+    return config
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pairs", nargs="+", default=DEFAULT_PAIRS)
+    parser.add_argument("--out", default=os.getenv("MODELS_DIR", "models"))
+    args = parser.parse_args()
+
+    out_root = Path(args.out)
+    out_root.mkdir(parents=True, exist_ok=True)
+    for pair in args.pairs:
+        train_pair(pair, out_root)
+
+
+if __name__ == "__main__":
+    main()

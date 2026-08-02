@@ -1,0 +1,5 @@
+torch
+tokenizers
+fastapi
+uvicorn
+pydantic

@@ -1,0 +1,9 @@
+torch
+tokenizers
+datasets
+evaluate
+sacrebleu
+fastapi
+uvicorn
+pydantic
+pytest
